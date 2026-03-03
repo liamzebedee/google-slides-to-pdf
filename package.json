@@ -1,0 +1,13 @@
+{
+  "name": "slides-to-pdf",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "slides": "node slides-to-pdf.js"
+  },
+  "dependencies": {
+    "pdf-lib": "^1.17.1",
+    "puppeteer": "^22.0.0",
+    "sharp": "^0.33.0"
+  }
+}
