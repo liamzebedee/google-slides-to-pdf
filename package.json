@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "slides": "node slides-to-pdf.js"
+    "slides": "node slides-to-pdf.js",
+    "test": "node test-links.js"
   },
   "dependencies": {
     "pdf-lib": "^1.17.1",

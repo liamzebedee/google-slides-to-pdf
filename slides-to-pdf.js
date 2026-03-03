@@ -7,7 +7,7 @@
  */
 
 const puppeteer = require("puppeteer");
-const { PDFDocument } = require("pdf-lib");
+const { PDFDocument, PDFName, PDFArray, PDFString, StandardFonts, rgb } = require("pdf-lib");
 const sharp = require("sharp");
 const fs = require("fs");
 const path = require("path");
@@ -104,8 +104,33 @@ async function run() {
       break;
     }
 
+    // Extract links from the current slide's DOM
+    const slideLinks = await page.evaluate(() => {
+      const links = [];
+      // Find all <a> elements (SVG anchors use xlink:href, not href attribute)
+      const anchors = document.querySelectorAll("a");
+      for (const a of anchors) {
+        const href = a.getAttribute("href") || a.getAttributeNS("http://www.w3.org/1999/xlink", "href");
+        if (!href || href === "#" || href.startsWith("javascript:")) continue;
+        const rect = a.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        links.push({
+          url: href,
+          x: rect.x,
+          y: rect.y,
+          width: rect.width,
+          height: rect.height,
+        });
+      }
+      return links;
+    });
+
+    if (slideLinks.length > 0) {
+      console.log(`    Found ${slideLinks.length} link(s) on slide ${slideIndex + 1}`);
+    }
+
     console.log(`  Captured slide ${slideIndex + 1} → ${path.basename(screenshotPath)}`);
-    screenshots.push(screenshotPath);
+    screenshots.push({ path: screenshotPath, links: slideLinks });
     prevFingerprint = fp;
     slideIndex++;
 
@@ -127,14 +152,112 @@ async function run() {
   console.log(`\nBuilding PDF from ${screenshots.length} slide(s)…`);
   const pdfDoc = await PDFDocument.create();
 
-  for (const imgPath of screenshots) {
-    const imgBytes = fs.readFileSync(imgPath);
+  // Viewport dimensions used for screenshots
+  const vpWidth = 1600;
+  const vpHeight = 900;
+
+  for (const slide of screenshots) {
+    const imgBytes = fs.readFileSync(slide.path);
     const jpegBytes = await sharp(imgBytes).jpeg({ quality: 92 }).toBuffer();
     const jpegImage = await pdfDoc.embedJpg(jpegBytes);
     const { width, height } = jpegImage.scale(1);
     const pdfPage = pdfDoc.addPage([width, height]);
     pdfPage.drawImage(jpegImage, { x: 0, y: 0, width, height });
+
+    // Add clickable link annotations
+    const scaleX = width / vpWidth;
+    const scaleY = height / vpHeight;
+
+    for (const link of slide.links) {
+      // Convert viewport coords to PDF coords (PDF origin is bottom-left)
+      const pdfX = link.x * scaleX;
+      const pdfY = height - (link.y + link.height) * scaleY;
+      const pdfW = link.width * scaleX;
+      const pdfH = link.height * scaleY;
+
+      // Resolve relative URLs and unwrap Google redirect
+      let url = link.url;
+      if (url.startsWith("/")) {
+        url = "https://docs.google.com" + url;
+      }
+      try {
+        const parsed = new URL(url);
+        if (parsed.hostname === "www.google.com" && parsed.pathname === "/url" && parsed.searchParams.has("q")) {
+          url = parsed.searchParams.get("q");
+        }
+      } catch (_) {}
+
+      const annotRef = pdfDoc.context.register(
+        pdfDoc.context.obj({
+          Type: "Annot",
+          Subtype: "Link",
+          Rect: [pdfX, pdfY, pdfX + pdfW, pdfY + pdfH],
+          Border: [0, 0, 0],
+          A: {
+            Type: "Action",
+            S: "URI",
+            URI: PDFString.of(url),
+          },
+        })
+      );
+
+      const existingAnnots = pdfPage.node.lookup(PDFName.of("Annots"));
+      if (existingAnnots instanceof PDFArray) {
+        existingAnnots.push(annotRef);
+      } else {
+        pdfPage.node.set(PDFName.of("Annots"), pdfDoc.context.obj([annotRef]));
+      }
+    }
   }
+
+  // Add a final page linking back to the original presentation
+  const lastSlide = screenshots[screenshots.length - 1];
+  const lastImgMeta = await sharp(fs.readFileSync(lastSlide.path)).metadata();
+  const finalPageWidth = lastImgMeta.width;
+  const finalPageHeight = lastImgMeta.height;
+  const finalPage = pdfDoc.addPage([finalPageWidth, finalPageHeight]);
+
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const labelText = "PDF extracted from original presentation:";
+  const linkText = RAW_URL;
+  const fontSize = 24;
+  const labelWidth = font.widthOfTextAtSize(labelText, fontSize);
+  const linkWidth = font.widthOfTextAtSize(linkText, fontSize);
+
+  const centerY = finalPageHeight / 2;
+  const labelX = (finalPageWidth - labelWidth) / 2;
+  const linkX = (finalPageWidth - linkWidth) / 2;
+
+  finalPage.drawText(labelText, {
+    x: labelX,
+    y: centerY + 20,
+    size: fontSize,
+    font,
+    color: rgb(0.3, 0.3, 0.3),
+  });
+  finalPage.drawText(linkText, {
+    x: linkX,
+    y: centerY - 20,
+    size: fontSize,
+    font,
+    color: rgb(0.1, 0.4, 0.8),
+  });
+
+  // Make the URL text a clickable link
+  const linkAnnotRef = pdfDoc.context.register(
+    pdfDoc.context.obj({
+      Type: "Annot",
+      Subtype: "Link",
+      Rect: [linkX, centerY - 20 - 5, linkX + linkWidth, centerY - 20 + fontSize + 2],
+      Border: [0, 0, 0],
+      A: {
+        Type: "Action",
+        S: "URI",
+        URI: PDFString.of(RAW_URL),
+      },
+    })
+  );
+  finalPage.node.set(PDFName.of("Annots"), pdfDoc.context.obj([linkAnnotRef]));
 
   const pdfPath = path.join(outDir, `${folderName}.pdf`);
   fs.writeFileSync(pdfPath, await pdfDoc.save());
